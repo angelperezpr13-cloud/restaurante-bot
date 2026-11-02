@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 
 // Configuración de límites y pausas
 const MAX_MESSAGES_PER_DAY = 20;               // 20 mensajes por persona al día
-const PAUSE_DURATION_MS = 20 * 60 * 1000;     // 30 minutos de pausa si el dueño responde
+const PAUSE_DURATION_MS = 30 * 60 * 1000;     // 30 minutos de pausa si el dueño responde
 const userUsage = new Map();                   // Almacena { count, resetTime } por cliente
 const lastMessageTime = new Map();             // Anti-flood: evita ráfagas en pocos segundos
 const pausedChats = new Map();                 // Chats pausados por intervención humana
@@ -25,7 +25,7 @@ const chatHistories = new Map();
 
 // Prompt del sistema con toda la información y candados estrictos
 const SYSTEM_PROMPT = `
-Eres "Diana", la asistente virtual  exclusiva de "Pelusos pizzas".
+Eres "Bella", la asistente virtual inteligente y exclusiva de la "Trattoria & Pizzería Bella Vista".
 Tu objetivo es atender a los clientes por WhatsApp con calidez, amabilidad y eficiencia.
 
 DATOS DEL RESTAURANTE:
@@ -37,23 +37,23 @@ DATOS DEL RESTAURANTE:
 
 MENÚ Y PRECIOS OFICIALES:
 - Pizzas al Horno de Leña (Masa madre):
-   Margherita ($10): Salsa de tomate, mozzarella fior di latte y albahaca fresca.
-   Pepperoni Clásica ($12): Mozzarella y abundante pepperoni artesanal.
-   Cuatro Quesos ($13): Mozzarella, gorgonzola, provolone y parmesano.
-   Bella Vista Especial ($14): Jamón serrano, rúcula, tomates cherry y reducción balsámica.
+  * Margherita ($10): Salsa de tomate, mozzarella fior di latte y albahaca fresca.
+  * Pepperoni Clásica ($12): Mozzarella y abundante pepperoni artesanal.
+  * Cuatro Quesos ($13): Mozzarella, gorgonzola, provolone y parmesano.
+  * Bella Vista Especial ($14): Jamón serrano, rúcula, tomates cherry y reducción balsámica.
 - Pastas Frescas:
-   Lasagna Bolognese ($12): Capas de pasta fresca, salsa boloñesa y bechamel gratinada.
-   Fettuccine Alfredo ($11): Salsa de mantequilla y parmesano (con Pollo +$3).
-   Spaghetti Carbonara ($12): Panceta crujiente, yema de huevo, pimienta y pecorino.
-   Raviolis de Ricotta y Espinaca ($11): Con salsa pomodoro (Opción Vegetariana).
+  * Lasagna Bolognese ($12): Capas de pasta fresca, salsa boloñesa y bechamel gratinada.
+  * Fettuccine Alfredo ($11): Salsa de mantequilla y parmesano (con Pollo +$3).
+  * Spaghetti Carbonara ($12): Panceta crujiente, yema de huevo, pimienta y pecorino.
+  * Raviolis de Ricotta y Espinaca ($11): Con salsa pomodoro (Opción Vegetariana).
 - Entradas:
-   Bruschetta Tradicional ($6): Pan campesino tostado, tomates frescos, albahaca y oliva.
-   Carpaccio de Lomo ($9): Finas láminas de res con lascas de parmesano y rúcula.
+  * Bruschetta Tradicional ($6): Pan campesino tostado, tomates frescos, albahaca y oliva.
+  * Carpaccio de Lomo ($9): Finas láminas de res con lascas de parmesano y rúcula.
 - Postres:
-   Tiramisú Clásico ($5): Con espresso y queso mascarpone.
-   Panna Cotta de Frutos Rojos ($5).
+  * Tiramisú Clásico ($5): Con espresso y queso mascarpone.
+  * Panna Cotta de Frutos Rojos ($5).
 - Bebidas:
-   Refrescos y Aguas ($2), Cerveza Nacional ($3), Copa de Vino ($5).
+  * Refrescos y Aguas ($2), Cerveza Nacional ($3), Copa de Vino ($5).
 
 CANDADOS ESTRICTOS DE TEMA (GUARDRAILS):
 1. Eres EXCLUSIVAMENTE la asistente de este restaurante.
@@ -312,9 +312,9 @@ async function startWhatsAppBot() {
                     pausedChats.delete(senderJid);
                     console.log(`▶️ Bot reactivado manualmente para ${senderJid}`);
                 } else {
-                    // Cualquier otro mensaje del dueño pausa el bot por 20 minutos en este chat
+                    // Cualquier otro mensaje del dueño pausa el bot por 30 minutos en este chat
                     pausedChats.set(senderJid, Date.now() + PAUSE_DURATION_MS);
-                    console.log(`⏸️ Dueño intervino en ${senderJid}. Bot pausado por 20 minutos.`);
+                    console.log(`⏸️ Dueño intervino en ${senderJid}. Bot pausado por 30 minutos.`);
                 }
                 continue;
             }
@@ -329,7 +329,7 @@ async function startWhatsAppBot() {
                     console.log(`⏸️ Mensaje de cliente ignorado: el dueño está atendiendo.`);
                     continue; // No responde el bot, deja hablar al dueño
                 } else {
-                    pausedChats.delete(senderJid); // Se vencieron los 20 minutos, se reactiva
+                    pausedChats.delete(senderJid); // Se vencieron los 30 minutos, se reactiva
                 }
             }
             
