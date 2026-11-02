@@ -1,19 +1,20 @@
 require('dotenv').config();
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
-const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const http = require('http');
 const axios = require('axios');
 const path = require('path');
 
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AQ.Ab8RN6LavmJY-Tccn1Gf_dGFolTPUJCCUSkeRBrfcnt5k21EPg';
 const PORT = process.env.PORT || 3000;
 
-// Configuración de límites de seguridad
-const MAX_MESSAGES_PER_DAY = 15; // Máximo de mensajes por persona al día
-const userUsage = new Map();     // Almacena { count, resetTime } por número de teléfono
-const lastMessageTime = new Map(); // Anti-flood: evita ráfagas de mensajes en pocos segundos
+// Configuración de límites y pausas
+const MAX_MESSAGES_PER_DAY = 20;               // 20 mensajes por persona al día
+const PAUSE_DURATION_MS = 20 * 60 * 1000;     // 30 minutos de pausa si el dueño responde
+const userUsage = new Map();                   // Almacena { count, resetTime } por cliente
+const lastMessageTime = new Map();             // Anti-flood: evita ráfagas en pocos segundos
+const pausedChats = new Map();                 // Chats pausados por intervención humana
 
 // Estado del código QR para la interfaz web
 let currentQrDataUrl = null;
@@ -24,7 +25,7 @@ const chatHistories = new Map();
 
 // Prompt del sistema con toda la información y candados estrictos
 const SYSTEM_PROMPT = `
-Eres "Bella", la asistente virtual inteligente y exclusiva de la "Trattoria & Pizzería Bella Vista".
+Eres "Diana", la asistente virtual  exclusiva de "Pelusos pizzas".
 Tu objetivo es atender a los clientes por WhatsApp con calidez, amabilidad y eficiencia.
 
 DATOS DEL RESTAURANTE:
@@ -36,23 +37,23 @@ DATOS DEL RESTAURANTE:
 
 MENÚ Y PRECIOS OFICIALES:
 - Pizzas al Horno de Leña (Masa madre):
-  * Margherita ($10): Salsa de tomate, mozzarella fior di latte y albahaca fresca.
-  * Pepperoni Clásica ($12): Mozzarella y abundante pepperoni artesanal.
-  * Cuatro Quesos ($13): Mozzarella, gorgonzola, provolone y parmesano.
-  * Bella Vista Especial ($14): Jamón serrano, rúcula, tomates cherry y reducción balsámica.
+   Margherita ($10): Salsa de tomate, mozzarella fior di latte y albahaca fresca.
+   Pepperoni Clásica ($12): Mozzarella y abundante pepperoni artesanal.
+   Cuatro Quesos ($13): Mozzarella, gorgonzola, provolone y parmesano.
+   Bella Vista Especial ($14): Jamón serrano, rúcula, tomates cherry y reducción balsámica.
 - Pastas Frescas:
-  * Lasagna Bolognese ($12): Capas de pasta fresca, salsa boloñesa y bechamel gratinada.
-  * Fettuccine Alfredo ($11): Salsa de mantequilla y parmesano (con Pollo +$3).
-  * Spaghetti Carbonara ($12): Panceta crujiente, yema de huevo, pimienta y pecorino.
-  * Raviolis de Ricotta y Espinaca ($11): Con salsa pomodoro (Opción Vegetariana).
+   Lasagna Bolognese ($12): Capas de pasta fresca, salsa boloñesa y bechamel gratinada.
+   Fettuccine Alfredo ($11): Salsa de mantequilla y parmesano (con Pollo +$3).
+   Spaghetti Carbonara ($12): Panceta crujiente, yema de huevo, pimienta y pecorino.
+   Raviolis de Ricotta y Espinaca ($11): Con salsa pomodoro (Opción Vegetariana).
 - Entradas:
-  * Bruschetta Tradicional ($6): Pan campesino tostado, tomates frescos, albahaca y oliva.
-  * Carpaccio de Lomo ($9): Finas láminas de res con lascas de parmesano y rúcula.
+   Bruschetta Tradicional ($6): Pan campesino tostado, tomates frescos, albahaca y oliva.
+   Carpaccio de Lomo ($9): Finas láminas de res con lascas de parmesano y rúcula.
 - Postres:
-  * Tiramisú Clásico ($5): Con espresso y queso mascarpone.
-  * Panna Cotta de Frutos Rojos ($5).
+   Tiramisú Clásico ($5): Con espresso y queso mascarpone.
+   Panna Cotta de Frutos Rojos ($5).
 - Bebidas:
-  * Refrescos y Aguas ($2), Cerveza Nacional ($3), Copa de Vino ($5).
+   Refrescos y Aguas ($2), Cerveza Nacional ($3), Copa de Vino ($5).
 
 CANDADOS ESTRICTOS DE TEMA (GUARDRAILS):
 1. Eres EXCLUSIVAMENTE la asistente de este restaurante.
@@ -69,12 +70,11 @@ REGLAS DE ATENCIÓN:
 5. Si solicitan hablar con un humano o tienen una queja, di: "Con gusto te comunico con nuestro encargado en este mismo chat".
 `;
 
-// Control de límite de mensajes por usuario (Rate Limiting)
+// Control de límite de mensajes por usuario
 function checkRateLimit(senderJid) {
     const now = Date.now();
     const ONE_DAY = 24 * 60 * 60 * 1000;
     
-    // Anti-flood: Ignorar si envía 2 mensajes en menos de 2 segundos
     const lastTime = lastMessageTime.get(senderJid) || 0;
     if (now - lastTime < 2000) {
         return { allowed: false, reason: 'flood' };
@@ -88,7 +88,6 @@ function checkRateLimit(senderJid) {
     
     const usage = userUsage.get(senderJid);
     if (now > usage.resetTime) {
-        // Reiniciar conteo diario
         usage.count = 1;
         usage.resetTime = now + ONE_DAY;
         return { allowed: true };
@@ -102,65 +101,64 @@ function checkRateLimit(senderJid) {
     return { allowed: true };
 }
 
-// Modelos de respaldo
-const MODELS_TO_TRY = [
-    'dots-studio/dots-3-note-preview:free',
-    'cohere/north-mini-code:free',
-    'nvidia/nemotron-3-ultra-550b-a55b:free'
+// Modelos oficiales de Google Gemini
+const GEMINI_MODELS = [
+    'gemini-3.5-flash',
+    'gemini-3.6-flash',
+    'gemini-3.5-flash-lite'
 ];
 
-// Función para consultar a la IA con memoria de chat
+// Función para consultar a Google Gemini
 async function getAiResponse(userJid, userMessage) {
     if (!chatHistories.has(userJid)) {
         chatHistories.set(userJid, []);
     }
     const history = chatHistories.get(userJid);
     
-    // Agregar mensaje del usuario al historial
-    history.push({ role: 'user', content: userMessage });
+    history.push({
+        role: 'user',
+        parts: [{ text: userMessage }]
+    });
     
-    // Mantener sólo los últimos 6 mensajes
-    if (history.length > 6) {
-        history.splice(0, history.length - 6);
+    if (history.length > 8) {
+        history.splice(0, history.length - 8);
     }
     
-    const messages = [
-        { role: 'system', content: SYSTEM_PROMPT },
-        ...history
-    ];
-    
-    for (const model of MODELS_TO_TRY) {
+    for (const model of GEMINI_MODELS) {
         try {
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
             const response = await axios.post(
-                'https://openrouter.ai/api/v1/chat/completions',
+                url,
                 {
-                    model: model,
-                    messages: messages,
-                    temperature: 0.5,
-                    max_tokens: 400
+                    system_instruction: {
+                        parts: [{ text: SYSTEM_PROMPT }]
+                    },
+                    contents: history,
+                    generationConfig: {
+                        temperature: 0.5,
+                        maxOutputTokens: 350
+                    }
                 },
                 {
-                    headers: {
-                        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-                        'Content-Type': 'application/json',
-                        'HTTP-Referer': 'https://github.com/restaurante-bot',
-                        'X-Title': 'Restaurante Bot'
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     timeout: 15000
                 }
             );
             
-            const reply = response.data?.choices?.[0]?.message?.content?.trim();
+            const reply = response.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
             if (reply && reply.length > 0) {
-                history.push({ role: 'assistant', content: reply });
+                history.push({
+                    role: 'model',
+                    parts: [{ text: reply }]
+                });
                 return reply;
             }
         } catch (err) {
-            console.error(`Error con modelo ${model}:`, err.response?.data?.error?.message || err.message);
+            console.error(`Error con Gemini ${model}:`, err.response?.data?.error?.message || err.message);
         }
     }
     
-    return "¡Hola! Tenemos disponibles nuestras Pizzas al Horno de Leña: Margherita ($10), Pepperoni ($12), Cuatro Quesos ($13) y Bella Vista Especial ($14). ¿Te gustaría ordenar alguna o reservar una mesa?";
+    return "¡Hola! En la Trattoria Bella Vista tenemos pizzas al horno de leña, pastas frescas y postres. ¿Te gustaría ordenar alguna o reservar una mesa?";
 }
 
 // Servidor Web para ver estado, ping y QR
@@ -176,7 +174,7 @@ const server = http.createServer((req, res) => {
                 <!DOCTYPE html>
                 <html>
                 <head>
-                    <title>WhatsApp Bot - Conectado</title>
+                    <title>WhatsApp Bot - Conectado con Gemini</title>
                     <meta name="viewport" content="width=device-width, initial-scale=1">
                     <style>
                         body { font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #0b141a; color: white; }
@@ -190,7 +188,7 @@ const server = http.createServer((req, res) => {
                     <div class="card">
                         <div class="success">✓</div>
                         <h2>¡WhatsApp Conectado!</h2>
-                        <p>El bot de <b>Trattoria Bella Vista</b> está activo y protegido contra abusos.</p>
+                        <p>El bot de <b>Trattoria Bella Vista</b> está activo con <b>Google Gemini</b> (1,500 msgs/día).</p>
                     </div>
                 </body>
                 </html>
@@ -233,7 +231,7 @@ const server = http.createServer((req, res) => {
                     <style>body { font-family: system-ui; display: flex; align-items: center; justify-content: center; height: 100vh; background: #111b21; color: white; }</style>
                 </head>
                 <body>
-                    <p>Reconectando con tu sesión de WhatsApp...</p>
+                    <p>Iniciando servicio de Gemini...</p>
                 </body>
                 </html>
             `);
@@ -285,7 +283,7 @@ async function startWhatsAppBot() {
             isConnected = true;
             currentQrDataUrl = null;
             console.log('\n🎉 ¡CONECTADO A WHATSAPP CON ÉXITO!');
-            console.log('🤖 Bella está lista con filtros y límites activos.\n');
+            console.log('🤖 Bella está activa con Google Gemini y pausa para el dueño.\n');
         }
     });
     
@@ -294,17 +292,49 @@ async function startWhatsAppBot() {
         if (type !== 'notify') return;
         
         for (const msg of messages) {
-            if (!msg.message || msg.key.fromMe || msg.key.remoteJid.includes('@broadcast')) continue;
+            if (!msg.message || msg.key.remoteJid.includes('@broadcast')) continue;
             if (msg.key.remoteJid.endsWith('@g.us')) continue;
             
+            const senderJid = msg.key.remoteJid;
             const text = msg.message.conversation || 
                          msg.message.extendedTextMessage?.text || 
                          msg.message.imageMessage?.caption || 
                          '';
             
+            // ========================================================
+            // CASO 1: EL DUEÑO RESPONDE DESDE SU TELÉFONO (fromMe: true)
+            // ========================================================
+            if (msg.key.fromMe) {
+                const cleanText = text.trim().toLowerCase();
+                
+                // Si el dueño escribe #bot o #activar, se reactiva de inmediato
+                if (cleanText === '#bot' || cleanText === '#activar') {
+                    pausedChats.delete(senderJid);
+                    console.log(`▶️ Bot reactivado manualmente para ${senderJid}`);
+                } else {
+                    // Cualquier otro mensaje del dueño pausa el bot por 20 minutos en este chat
+                    pausedChats.set(senderJid, Date.now() + PAUSE_DURATION_MS);
+                    console.log(`⏸️ Dueño intervino en ${senderJid}. Bot pausado por 20 minutos.`);
+                }
+                continue;
+            }
+            
+            // ========================================================
+            // CASO 2: EL CLIENTE ESCRIBE
+            // ========================================================
+            // Si el chat está en pausa porque el dueño está hablando:
+            if (pausedChats.has(senderJid)) {
+                const pauseUntil = pausedChats.get(senderJid);
+                if (Date.now() < pauseUntil) {
+                    console.log(`⏸️ Mensaje de cliente ignorado: el dueño está atendiendo.`);
+                    continue; // No responde el bot, deja hablar al dueño
+                } else {
+                    pausedChats.delete(senderJid); // Se vencieron los 20 minutos, se reactiva
+                }
+            }
+            
             if (!text.trim()) continue;
             
-            const senderJid = msg.key.remoteJid;
             const pushName = msg.pushName || 'Cliente';
             
             // Verificar límites de seguridad
@@ -314,7 +344,6 @@ async function startWhatsAppBot() {
                     const limitMsg = "⚠️ *Aviso:* Has alcanzado el límite de consultas automáticas por el día de hoy. Si necesitas atención adicional o realizar un pedido especial, un encargado te atenderá en este chat en breve. ¡Muchas gracias!";
                     await sock.sendMessage(senderJid, { text: limitMsg });
                 }
-                // Si es 'flood' simplemente se ignora para evitar sobrecarga
                 continue;
             }
             
@@ -326,7 +355,7 @@ async function startWhatsAppBot() {
             } catch (e) {}
             
             const aiReply = await getAiResponse(senderJid, text);
-            console.log(`🤖 Respuesta a ${pushName}: "${aiReply}"\n`);
+            console.log(`🤖 Respuesta Gemini a ${pushName}: "${aiReply}"\n`);
             
             try {
                 await sock.sendPresenceUpdate('paused', senderJid);
