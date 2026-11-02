@@ -103,7 +103,7 @@ function checkRateLimit(senderJid) {
 
 // Modelos oficiales de Google Gemini
 const GEMINI_MODELS = [
-    'gemini-3.5-flash',
+    'gemini-3.8-flash',
     'gemini-3.6-flash',
     'gemini-3.5-flash-lite'
 ];
@@ -136,7 +136,7 @@ async function getAiResponse(userJid, userMessage) {
                     contents: history,
                     generationConfig: {
                         temperature: 0.5,
-                        maxOutputTokens: 350
+                        maxOutputTokens: 2500
                     }
                 },
                 {
