@@ -10,6 +10,11 @@ const path = require('path');
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const PORT = process.env.PORT || 3000;
 
+// Configuración de límites de seguridad
+const MAX_MESSAGES_PER_DAY = 15; // Máximo de mensajes por persona al día
+const userUsage = new Map();     // Almacena { count, resetTime } por número de teléfono
+const lastMessageTime = new Map(); // Anti-flood: evita ráfagas de mensajes en pocos segundos
+
 // Estado del código QR para la interfaz web
 let currentQrDataUrl = null;
 let isConnected = false;
@@ -17,9 +22,9 @@ let isConnected = false;
 // Memoria de conversación por usuario
 const chatHistories = new Map();
 
-// Prompt del sistema con toda la información del restaurante
+// Prompt del sistema con toda la información y candados estrictos
 const SYSTEM_PROMPT = `
-Eres "Bella", la asistente virtual inteligente de la "Trattoria & Pizzería Bella Vista".
+Eres "Bella", la asistente virtual inteligente y exclusiva de la "Trattoria & Pizzería Bella Vista".
 Tu objetivo es atender a los clientes por WhatsApp con calidez, amabilidad y eficiencia.
 
 DATOS DEL RESTAURANTE:
@@ -29,35 +34,75 @@ DATOS DEL RESTAURANTE:
 - Métodos de pago: Dólares en efectivo, Zelle, Pago Móvil y Tarjetas internacionales.
 - Estacionamiento: Sí, contamos con valet parking gratuito.
 
-MENÚ Y PRECIOS:
+MENÚ Y PRECIOS OFICIALES:
 - Pizzas al Horno de Leña (Masa madre):
   * Margherita ($10): Salsa de tomate, mozzarella fior di latte y albahaca fresca.
   * Pepperoni Clásica ($12): Mozzarella y abundante pepperoni artesanal.
   * Cuatro Quesos ($13): Mozzarella, gorgonzola, provolone y parmesano.
   * Bella Vista Especial ($14): Jamón serrano, rúcula, tomates cherry y reducción balsámica.
 - Pastas Frescas:
-  * Lasagna Bolognese ($12): Capas de pasta fresca, carne molida en salsa boloñesa y bechamel gratinada.
-  * Fettuccine Alfredo ($11): En cremosa salsa de mantequilla y parmesano (con Pollo +$3).
-  * Spaghetti Carbonara ($12): Panceta crujiente, yema de huevo, pimienta y queso pecorino.
+  * Lasagna Bolognese ($12): Capas de pasta fresca, salsa boloñesa y bechamel gratinada.
+  * Fettuccine Alfredo ($11): Salsa de mantequilla y parmesano (con Pollo +$3).
+  * Spaghetti Carbonara ($12): Panceta crujiente, yema de huevo, pimienta y pecorino.
   * Raviolis de Ricotta y Espinaca ($11): Con salsa pomodoro (Opción Vegetariana).
 - Entradas:
-  * Bruschetta Tradicional ($6): Pan campesino tostado, tomates frescos, albahaca y aceite de oliva virgen.
-  * Carpaccio de Lomo ($9): Finas láminas de carne de res con lascas de parmesano y rúcula.
+  * Bruschetta Tradicional ($6): Pan campesino tostado, tomates frescos, albahaca y oliva.
+  * Carpaccio de Lomo ($9): Finas láminas de res con lascas de parmesano y rúcula.
 - Postres:
   * Tiramisú Clásico ($5): Con espresso y queso mascarpone.
   * Panna Cotta de Frutos Rojos ($5).
 - Bebidas:
   * Refrescos y Aguas ($2), Cerveza Nacional ($3), Copa de Vino ($5).
 
+CANDADOS ESTRICTOS DE TEMA (GUARDRAILS):
+1. Eres EXCLUSIVAMENTE la asistente de este restaurante.
+2. NUNCA respondas sobre: tareas, matemáticas, programación, política, noticias, deportes, chistes, ensayos o temas generales ajenos al negocio.
+3. Si el cliente pregunta algo fuera del restaurante, responde cortésmente diciendo:
+   "Disculpa, soy la asistente virtual exclusiva de Trattoria Bella Vista 🍕🍝. Solo puedo ayudarte con nuestro menú, precios, reservas y horarios. ¿Te gustaría consultar nuestra carta de hoy?"
+4. No inventes platos ni promociones que no figuren en la lista.
+
 REGLAS DE ATENCIÓN:
 1. Saluda amablemente y mantén un tono educado, cercano y fresco (usa emojis con buen gusto 🍕🍝).
 2. Responde de forma clara y directa (estás en WhatsApp, no escribas bloques enormes).
-3. Si preguntan por pizzas o menú, da los nombres y sus precios exactos según la lista anterior.
-4. Para RESERVAS: Pide siempre (1) Nombre completo, (2) Número de personas, (3) Fecha y (4) Hora. Confírmale la reserva con un resumen.
-5. Opciones dietéticas: Tenemos opciones vegetarianas (Raviolis, Margherita, Bruschettas) y avisando con antelación adaptamos para celíacos.
+3. Para RESERVAS: Pide siempre (1) Nombre completo, (2) Número de personas, (3) Fecha y (4) Hora. Confírmale la reserva con un resumen.
+4. Opciones dietéticas: Tenemos opciones vegetarianas (Raviolis, Margherita, Bruschettas) y avisando con antelación adaptamos para celíacos.
+5. Si solicitan hablar con un humano o tienen una queja, di: "Con gusto te comunico con nuestro encargado en este mismo chat".
 `;
 
-// Modelos comprobados y funcionales sin saturación
+// Control de límite de mensajes por usuario (Rate Limiting)
+function checkRateLimit(senderJid) {
+    const now = Date.now();
+    const ONE_DAY = 24 * 60 * 60 * 1000;
+    
+    // Anti-flood: Ignorar si envía 2 mensajes en menos de 2 segundos
+    const lastTime = lastMessageTime.get(senderJid) || 0;
+    if (now - lastTime < 2000) {
+        return { allowed: false, reason: 'flood' };
+    }
+    lastMessageTime.set(senderJid, now);
+    
+    if (!userUsage.has(senderJid)) {
+        userUsage.set(senderJid, { count: 1, resetTime: now + ONE_DAY });
+        return { allowed: true };
+    }
+    
+    const usage = userUsage.get(senderJid);
+    if (now > usage.resetTime) {
+        // Reiniciar conteo diario
+        usage.count = 1;
+        usage.resetTime = now + ONE_DAY;
+        return { allowed: true };
+    }
+    
+    if (usage.count >= MAX_MESSAGES_PER_DAY) {
+        return { allowed: false, reason: 'daily_limit' };
+    }
+    
+    usage.count++;
+    return { allowed: true };
+}
+
+// Modelos de respaldo
 const MODELS_TO_TRY = [
     'dots-studio/dots-3-note-preview:free',
     'cohere/north-mini-code:free',
@@ -74,9 +119,9 @@ async function getAiResponse(userJid, userMessage) {
     // Agregar mensaje del usuario al historial
     history.push({ role: 'user', content: userMessage });
     
-    // Mantener sólo los últimos 8 mensajes
-    if (history.length > 8) {
-        history.splice(0, history.length - 8);
+    // Mantener sólo los últimos 6 mensajes
+    if (history.length > 6) {
+        history.splice(0, history.length - 6);
     }
     
     const messages = [
@@ -91,8 +136,8 @@ async function getAiResponse(userJid, userMessage) {
                 {
                     model: model,
                     messages: messages,
-                    temperature: 0.6,
-                    max_tokens: 450
+                    temperature: 0.5,
+                    max_tokens: 400
                 },
                 {
                     headers: {
@@ -107,7 +152,6 @@ async function getAiResponse(userJid, userMessage) {
             
             const reply = response.data?.choices?.[0]?.message?.content?.trim();
             if (reply && reply.length > 0) {
-                // Guardar respuesta del bot en el historial
                 history.push({ role: 'assistant', content: reply });
                 return reply;
             }
@@ -119,7 +163,7 @@ async function getAiResponse(userJid, userMessage) {
     return "¡Hola! Tenemos disponibles nuestras Pizzas al Horno de Leña: Margherita ($10), Pepperoni ($12), Cuatro Quesos ($13) y Bella Vista Especial ($14). ¿Te gustaría ordenar alguna o reservar una mesa?";
 }
 
-// Servidor Web local para ver estado y QR
+// Servidor Web para ver estado, ping y QR
 const server = http.createServer((req, res) => {
     if (req.url === '/ping' || req.url === '/health') {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -146,7 +190,7 @@ const server = http.createServer((req, res) => {
                     <div class="card">
                         <div class="success">✓</div>
                         <h2>¡WhatsApp Conectado!</h2>
-                        <p>El bot de <b>Trattoria Bella Vista</b> está activo y respondiendo mensajes en tiempo real.</p>
+                        <p>El bot de <b>Trattoria Bella Vista</b> está activo y protegido contra abusos.</p>
                     </div>
                 </body>
                 </html>
@@ -201,7 +245,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-    console.log(`🌐 Servidor activo en: http://localhost:${PORT}/qr`);
+    console.log(`🌐 Servidor activo en puerto ${PORT}`);
 });
 
 // Inicializar conexión con WhatsApp (Baileys)
@@ -224,7 +268,6 @@ async function startWhatsAppBot() {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
-            console.log('\n📱 Código QR disponible en: http://localhost:' + PORT + '/qr\n');
             try {
                 currentQrDataUrl = await QRCode.toDataURL(qr);
             } catch (e) {}
@@ -242,7 +285,7 @@ async function startWhatsAppBot() {
             isConnected = true;
             currentQrDataUrl = null;
             console.log('\n🎉 ¡CONECTADO A WHATSAPP CON ÉXITO!');
-            console.log('🤖 Bella está lista para responder mensajes.\n');
+            console.log('🤖 Bella está lista con filtros y límites activos.\n');
         }
     });
     
@@ -251,13 +294,9 @@ async function startWhatsAppBot() {
         if (type !== 'notify') return;
         
         for (const msg of messages) {
-            // Ignorar mensajes enviados por el bot mismo o estados
             if (!msg.message || msg.key.fromMe || msg.key.remoteJid.includes('@broadcast')) continue;
-            
-            // Ignorar grupos
             if (msg.key.remoteJid.endsWith('@g.us')) continue;
             
-            // Extraer el texto del mensaje
             const text = msg.message.conversation || 
                          msg.message.extendedTextMessage?.text || 
                          msg.message.imageMessage?.caption || 
@@ -267,23 +306,33 @@ async function startWhatsAppBot() {
             
             const senderJid = msg.key.remoteJid;
             const pushName = msg.pushName || 'Cliente';
-            console.log(`📩 Mensaje recibido de ${pushName}: "${text}"`);
             
-            // Indicar que el bot está escribiendo (typing)
+            // Verificar límites de seguridad
+            const rateCheck = checkRateLimit(senderJid);
+            if (!rateCheck.allowed) {
+                if (rateCheck.reason === 'daily_limit') {
+                    const limitMsg = "⚠️ *Aviso:* Has alcanzado el límite de consultas automáticas por el día de hoy. Si necesitas atención adicional o realizar un pedido especial, un encargado te atenderá en este chat en breve. ¡Muchas gracias!";
+                    await sock.sendMessage(senderJid, { text: limitMsg });
+                }
+                // Si es 'flood' simplemente se ignora para evitar sobrecarga
+                continue;
+            }
+            
+            console.log(`📩 Mensaje de ${pushName}: "${text}"`);
+            
+            // Estado escribiendo...
             try {
                 await sock.sendPresenceUpdate('composing', senderJid);
             } catch (e) {}
             
-            // Obtener respuesta de la IA
             const aiReply = await getAiResponse(senderJid, text);
-            console.log(`🤖 Respuesta enviada a ${pushName}: "${aiReply}"\n`);
+            console.log(`🤖 Respuesta a ${pushName}: "${aiReply}"\n`);
             
-            // Enviar respuesta por WhatsApp
             try {
                 await sock.sendPresenceUpdate('paused', senderJid);
                 await sock.sendMessage(senderJid, { text: aiReply });
             } catch (err) {
-                console.error('Error enviando mensaje de WhatsApp:', err);
+                console.error('Error enviando mensaje:', err);
             }
         }
     });
